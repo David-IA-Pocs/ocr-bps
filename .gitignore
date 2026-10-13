@@ -1,2 +1,5 @@
 __pycache__/
 .venv/
+muestras_venus/*_boxes.png
+muestras_venus/*_boxes.jpg
+muestras_venus/*.txt
