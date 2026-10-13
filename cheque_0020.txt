@@ -1,0 +1,23 @@
+CTA	confianza: 0.722181
+CTE	confianza: 0.977948
+BANCO ESTUDIANTIL VENUS	confianza: 0.669861
+00-011	confianza: 0.797143
+04	confianza: 0.987781
+COMPANIA ANONIMA	confianza: 0.934518
+763	confianza: 0.998446
+CHEQUE No	confianza: 0.783555
+PÁGBESEN DE	confianza: 0.365869
+Ica_Lona	confianza: 0.164046
+02	confianza: 0.135207
+USS	confianza: 0.908561
+13	confianza: 0.998143
+LA SUMA DE	confianza: 0.719122
+TeeLe	confianza: 0.310558
+DOLARES	confianza: 0.990454
+Qvik	confianza: 0.458519
+2[3 [zo 2	confianza: 0.627629
+LUGAR Y FECHA DE EMISION	confianza: 0.813995
+AMA	confianza: 0.114709
+NOINVAD	confianza: 0.577970
+ESTA ZONA CON RACOS CALIGRAFICOS NI SELLOS	confianza: 0.402643
+Oiaz	confianza: 0.466618
