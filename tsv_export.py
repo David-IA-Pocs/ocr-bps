@@ -24,8 +24,8 @@ def geometry_column(key: str) -> Callable[[Detection], str]:
 
 
 COLUMNS: list[tuple[str, Callable[[Detection], str]]] = [
-    ("texto", lambda d: ""),
-    ("confianza", lambda d: ""),
+    ("text", lambda d: ""),
+    ("conf", lambda d: ""),
     ("left", geometry_column("left")),
     ("top", geometry_column("top")),
     ("width", geometry_column("width")),

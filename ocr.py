@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -11,6 +12,7 @@ import onnxruntime as ort
 from rapidocr import RapidOCR
 from rapidocr.inference_engine.onnxruntime.provider_config import EP, ProviderConfig
 
+from post_ocr import correct_text
 from tsv_export import compute_geometry, write_tsv
 
 
@@ -77,7 +79,7 @@ def process_image(image_path: Path, ocr_engine: RapidOCR, worker_id: int) -> flo
     start_time = time.perf_counter()
     OUTPUT_OCR_DIR.mkdir(parents=True, exist_ok=True)
     boxes_image_path = OUTPUT_OCR_DIR / f"{image_path.stem}_boxes{image_path.suffix}"
-    text_path = OUTPUT_OCR_DIR / f"{image_path.stem}.txt"
+    json_path = OUTPUT_OCR_DIR / f"{image_path.stem}.json"
     result = ocr_engine(image_path)
 
     image = cv2.imread(str(image_path))
@@ -93,56 +95,65 @@ def process_image(image_path: Path, ocr_engine: RapidOCR, worker_id: int) -> flo
     crops_dir.mkdir(parents=True, exist_ok=True)
     height, width = original.shape[:2]
     detections = []
+    json_detections = []
 
-    with text_path.open("w", encoding="utf-8") as text_file:
-        for box, text, confidence in zip(boxes, texts, confidences):
-            points = [[int(round(x)), int(round(y))] for x, y in box]
-            contour = cv2.convexHull(np.array(points, dtype="int32"))
-            cv2.polylines(image, [contour], True, (0, 255, 0), 2)
+    for box, text, confidence in zip(boxes, texts, confidences):
+        points = [[int(round(x)), int(round(y))] for x, y in box]
+        contour = cv2.convexHull(np.array(points, dtype="int32"))
+        cv2.polylines(image, [contour], True, (0, 255, 0), 2)
 
-            label = f"{text} ({float(confidence):.2%})"
-            x, y = points[0]
-            cv2.putText(
-                image,
-                label,
-                (x, max(y - 8, 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 0, 255),
-                2,
-                cv2.LINE_AA,
+        label = f"{text} ({float(confidence):.2%})"
+        x, y = points[0]
+        cv2.putText(
+            image,
+            label,
+            (x, max(y - 8, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        geometry = compute_geometry(points)
+        x_min, y_min = geometry["left"], geometry["top"]
+        x_max, y_max = x_min + geometry["width"], y_min + geometry["height"]
+        cx_min, cy_min = max(x_min, 0), max(y_min, 0)
+        cx_max, cy_max = min(x_max, width), min(y_max, height)
+        if cx_max > cx_min and cy_max > cy_min:
+            crop_name = (
+                f"{geometry['left']}_{geometry['top']}"
+                f"_{geometry['width']}_{geometry['height']}{image_path.suffix}"
             )
-            x_min, y_min = min(p[0] for p in points), min(p[1] for p in points)
-            x_max, y_max = max(p[0] for p in points), max(p[1] for p in points)
-            cx_min, cy_min = max(x_min, 0), max(y_min, 0)
-            cx_max, cy_max = min(x_max, width), min(y_max, height)
-            if cx_max > cx_min and cy_max > cy_min:
-                geometry = compute_geometry(points)
-                crop_name = (
-                    f"{geometry['left']}_{geometry['top']}"
-                    f"_{geometry['width']}_{geometry['height']}{image_path.suffix}"
-                )
-                cv2.imwrite(
-                    str(crops_dir / crop_name),
-                    original[cy_min:cy_max, cx_min:cx_max],
-                )
-            text_file.write(
-                f"{text}\tconfianza: {float(confidence):.6f}"
-                f"\tcoordenadas: {points}"
-                f"\tbbox: [{x_min}, {y_min}, {x_max}, {y_max}]\n"
+            cv2.imwrite(
+                str(crops_dir / crop_name),
+                original[cy_min:cy_max, cx_min:cx_max],
             )
-            detections.append(
-                {"text": text, "confidence": confidence, "points": points}
-            )
+        detections.append({"text": text, "confidence": confidence, "points": points})
+        json_detections.append(
+            {
+                "texto": {"ocr_original": text, "post_ocr": correct_text(text)},
+                "confianza": round(float(confidence), 6),
+                **geometry,
+                "puntos": points,
+            }
+        )
 
     write_tsv(crops_dir / f"{image_path.stem}.tsv", detections)
+    json_path.write_text(
+        json.dumps(
+            {"imagen": image_path.name, "detecciones": json_detections},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     if not cv2.imwrite(str(boxes_image_path), image):
         raise OSError(f"No se pudo guardar la imagen anotada: {boxes_image_path}")
 
     print(f"Worker {worker_id}: {image_path}")
     print(f"  Imagen con boxes: {boxes_image_path}")
-    print(f"  Texto y confianza: {text_path}")
+    print(f"  JSON (OCR original y post-OCR): {json_path}")
     elapsed_time = time.perf_counter() - start_time
     print(f"  Tiempo: {elapsed_time:.2f} segundos")
     return elapsed_time
