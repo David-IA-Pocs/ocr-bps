@@ -2,4 +2,6 @@ __pycache__/
 .venv/
 muestras_venus/*_boxes.png
 muestras_venus/*_boxes.jpg
+muestras_venus/*.jpg
+muestras_venus/*.png
 muestras_venus/*.txt

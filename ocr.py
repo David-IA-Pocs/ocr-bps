@@ -157,8 +157,8 @@ def process_folder(folder_path: str | Path, max_workers: int = 2) -> None:
             if current_worker == worker_id
         ]
         print(f"Worker {worker_id}: {len(worker_images)} imágenes")
-        for image_path in worker_images:
-            print(f"  - {image_path}")
+        # for image_path in worker_images:
+        #     print(f"  - {image_path}")
 
 
 if __name__ == "__main__":
