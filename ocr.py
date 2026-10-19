@@ -11,8 +11,12 @@ import onnxruntime as ort
 from rapidocr import RapidOCR
 from rapidocr.inference_engine.onnxruntime.provider_config import EP, ProviderConfig
 
+from tsv_export import compute_geometry, write_tsv
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+OUTPUT_OCR_DIR = Path(__file__).resolve().parent / "output_ocr"
 worker_context = local()
 
 
@@ -71,10 +75,9 @@ def _get_worker_ocr_engine() -> RapidOCR:
 def process_image(image_path: Path, ocr_engine: RapidOCR, worker_id: int) -> float:
     """Procesa una imagen y guarda su imagen anotada y su texto extraído."""
     start_time = time.perf_counter()
-    boxes_image_path = image_path.with_name(
-        f"{image_path.stem}_boxes{image_path.suffix}"
-    )
-    text_path = image_path.with_suffix(".txt")
+    OUTPUT_OCR_DIR.mkdir(parents=True, exist_ok=True)
+    boxes_image_path = OUTPUT_OCR_DIR / f"{image_path.stem}_boxes{image_path.suffix}"
+    text_path = OUTPUT_OCR_DIR / f"{image_path.stem}.txt"
     result = ocr_engine(image_path)
 
     image = cv2.imread(str(image_path))
@@ -84,6 +87,12 @@ def process_image(image_path: Path, ocr_engine: RapidOCR, worker_id: int) -> flo
     boxes = result.boxes if result.boxes is not None else []
     texts = result.txts if result.txts is not None else []
     confidences = result.scores if result.scores is not None else []
+
+    original = image.copy()
+    crops_dir = OUTPUT_DIR / f"{image_path.stem}_ocr"
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    height, width = original.shape[:2]
+    detections = []
 
     with text_path.open("w", encoding="utf-8") as text_file:
         for box, text, confidence in zip(boxes, texts, confidences):
@@ -103,7 +112,30 @@ def process_image(image_path: Path, ocr_engine: RapidOCR, worker_id: int) -> flo
                 2,
                 cv2.LINE_AA,
             )
-            text_file.write(f"{text}\tconfianza: {float(confidence):.6f}\n")
+            x_min, y_min = min(p[0] for p in points), min(p[1] for p in points)
+            x_max, y_max = max(p[0] for p in points), max(p[1] for p in points)
+            cx_min, cy_min = max(x_min, 0), max(y_min, 0)
+            cx_max, cy_max = min(x_max, width), min(y_max, height)
+            if cx_max > cx_min and cy_max > cy_min:
+                geometry = compute_geometry(points)
+                crop_name = (
+                    f"{geometry['left']}_{geometry['top']}"
+                    f"_{geometry['width']}_{geometry['height']}{image_path.suffix}"
+                )
+                cv2.imwrite(
+                    str(crops_dir / crop_name),
+                    original[cy_min:cy_max, cx_min:cx_max],
+                )
+            text_file.write(
+                f"{text}\tconfianza: {float(confidence):.6f}"
+                f"\tcoordenadas: {points}"
+                f"\tbbox: [{x_min}, {y_min}, {x_max}, {y_max}]\n"
+            )
+            detections.append(
+                {"text": text, "confidence": confidence, "points": points}
+            )
+
+    write_tsv(crops_dir / f"{image_path.stem}.tsv", detections)
 
     if not cv2.imwrite(str(boxes_image_path), image):
         raise OSError(f"No se pudo guardar la imagen anotada: {boxes_image_path}")

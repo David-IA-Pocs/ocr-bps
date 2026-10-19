@@ -5,7 +5,7 @@ from ocr import process_folder
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Procesa una carpeta de imágenes con OCR.")
-    parser.add_argument("--workers", type=int, default=10, help="Cantidad de workers a usar.")
+    parser.add_argument("--workers", type=int, default=6, help="Cantidad de workers a usar.")
     parser.add_argument(
         "folder",
         nargs="?",
