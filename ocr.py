@@ -1,10 +1,12 @@
 import argparse
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from threading import local
 import numpy as np
 import cv2
+import onnxruntime as ort
 
 from rapidocr import RapidOCR
 from rapidocr.inference_engine.onnxruntime.provider_config import EP, ProviderConfig
@@ -14,37 +16,49 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 worker_context = local()
 
 
-def _patch_rapidocr_for_directml() -> None:
-    if getattr(ProviderConfig, "_bps_directml_patched", False):
-        return
+def _patch_dml_provider_name() -> None:
+    # rapidocr pasa (nombre, {}) a DirectML y onnxruntime lo rechaza; requiere solo el nombre.
+    original = ProviderConfig.get_ep_list
 
-    def patched_get_ep_list(self) -> list:
-        results = [(EP.CPU_EP.value, self.cpu_ep_cfg())]
+    def patched(self) -> list:
+        return [
+            EP.DIRECTML_EP.value if ep[0] == EP.DIRECTML_EP.value else ep
+            for ep in original(self)
+        ]
 
-        if self.is_cuda_available():
-            results.insert(0, (EP.CUDA_EP.value, self.cuda_ep_cfg()))
+    ProviderConfig.get_ep_list = patched
 
-        if self.is_dml_available():
-            results.insert(0, EP.DIRECTML_EP.value)
 
-        if self.is_cann_available():
-            results.insert(0, (EP.CANN_EP.value, self.cann_ep_cfg()))
-
-        if self.is_coreml_available():
-            results.insert(0, (EP.COREML_EP.value, self.coreml_ep_cfg()))
-
-        return results
-
-    ProviderConfig.get_ep_list = patched_get_ep_list
-    ProviderConfig._bps_directml_patched = True
+def _select_provider() -> str:
+    available = ort.get_available_providers()
+    if "CUDAExecutionProvider" in available:
+        return "CUDA"
+    if "DmlExecutionProvider" in available:
+        return "DirectML"
+    return "CPU"
 
 
 def _build_ocr_engine() -> RapidOCR:
-    _patch_rapidocr_for_directml()
-
+    # Carga CUDA/cuDNN desde paquetes pip nvidia-* o desde el PATH si existen.
+    if hasattr(ort, "preload_dlls"):
+        ort.preload_dlls()
     ocr_engine = RapidOCR()
-    ocr_engine.cfg.EngineConfig.onnxruntime.use_dml = True
-    ocr_engine.cfg.EngineConfig.onnxruntime.dml_ep_cfg = {}
+    provider = _select_provider()
+    onnx_cfg = ocr_engine.cfg.EngineConfig.onnxruntime
+    if provider == "CUDA":
+        onnx_cfg.use_cuda = True
+    elif provider == "DirectML":
+        _patch_dml_provider_name()
+        onnx_cfg.use_dml = True
+        onnx_cfg.dml_ep_cfg = {}
+
+    # Los modelos se cargan en la primera inferencia; se fuerza para verificar el dispositivo real.
+    ocr_engine(np.full((64, 256, 3), 255, dtype=np.uint8))
+    active = ocr_engine.text_det.session.session.get_providers()[0]
+    device = "CPU" if active == "CPUExecutionProvider" else f"GPU ({active})"
+    print(f"\n===== [pid {os.getpid()}] USANDO: {device} =====")
+    if provider != "CPU" and device == "CPU":
+        print(f"===== Se pidió {provider} pero se cayó a CPU: faltan DLLs de CUDA/cuDNN (revisa el error de onnxruntime arriba) =====")
     return ocr_engine
 
 
