@@ -12,7 +12,7 @@ import onnxruntime as ort
 from rapidocr import RapidOCR
 from rapidocr.inference_engine.onnxruntime.provider_config import EP, ProviderConfig
 
-from post_ocr import correct_text
+
 from tsv_export import compute_geometry, write_tsv
 
 
@@ -131,7 +131,7 @@ def process_image(image_path: Path, ocr_engine: RapidOCR, worker_id: int) -> flo
         detections.append({"text": text, "confidence": confidence, "points": points})
         json_detections.append(
             {
-                "texto": {"ocr_original": text, "post_ocr": correct_text(text)},
+                "texto": {"ocr_original": text, "api": "", "llm": ""},
                 "confianza": round(float(confidence), 6),
                 **geometry,
                 "puntos": points,
