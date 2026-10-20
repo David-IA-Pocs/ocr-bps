@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import local
 import numpy as np
@@ -131,7 +131,7 @@ def process_image(image_path: Path, ocr_engine: RapidOCR, worker_id: int) -> flo
         detections.append({"text": text, "confidence": confidence, "points": points})
         json_detections.append(
             {
-                "texto": {"ocr_original": text, "api": "", "llm": ""},
+                "texto": {"ocr_original": text, "trocr": "", "llm": ""},
                 "confianza": round(float(confidence), 6),
                 **geometry,
                 "puntos": points,
@@ -166,6 +166,48 @@ def process_image_task(arguments: tuple[Path, int]) -> tuple[int, Path, float]:
     return worker_id, image_path, elapsed_time
 
 
+def list_images(folder: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in folder.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_EXTENSIONS
+        and not path.stem.endswith("_boxes")
+    )
+
+
+def iter_process_images(folder_path: str | Path, max_workers: int = 2):
+    """Procesa las imágenes en paralelo y cede (imagen, segundos) en cuanto cada una termina.
+
+    Al ceder una imagen ya existen su carpeta de recortes, su TSV y su JSON.
+    """
+    folder = Path(folder_path).expanduser().resolve()
+    if not folder.is_dir():
+        raise NotADirectoryError(f"La ruta no es una carpeta: {folder}")
+    if max_workers < 1:
+        raise ValueError("max_workers debe ser mayor que cero")
+
+    image_paths = list_images(folder)
+    if not image_paths:
+        print(f"No se encontraron imágenes en: {folder}")
+        return
+
+    executor_class = ProcessPoolExecutor if max_workers > 1 else ThreadPoolExecutor
+    with executor_class(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_image_task, (path, index % max_workers + 1)): path
+            for index, path in enumerate(image_paths)
+        }
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                _, _, elapsed = future.result()
+            except Exception as error:
+                print(f"[OCR][ERROR] {path.name}: {error}")
+                continue
+            yield path, elapsed
+
+
 def process_folder(folder_path: str | Path, max_workers: int = 2) -> None:
     """Procesa todas las imágenes que se encuentran directamente en una carpeta."""
     folder = Path(folder_path).expanduser().resolve()
@@ -174,13 +216,7 @@ def process_folder(folder_path: str | Path, max_workers: int = 2) -> None:
     if max_workers < 1:
         raise ValueError("max_workers debe ser mayor que cero")
 
-    image_paths = sorted(
-        path
-        for path in folder.iterdir()
-        if path.is_file()
-        and path.suffix.lower() in IMAGE_EXTENSIONS
-        and not path.stem.endswith("_boxes")
-    )
+    image_paths = list_images(folder)
     if not image_paths:
         print(f"No se encontraron imágenes en: {folder}")
         return

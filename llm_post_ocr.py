@@ -68,7 +68,7 @@ FEW_SHOT = [
 
 SELECT_PROMPT = (
     "Recibes dos lecturas OCR del MISMO fragmento de un cheque o documento bancario "
-    "en español: 'A' (OCR local) y 'B' (OCR de la API). Cada una puede tener errores.\n"
+    "en español: 'A' (OCR local) y 'B' (TrOCR). Cada una puede tener errores.\n"
     "Tu tarea: decidir cuál tiene más sentido semántico (o combinarlas si se "
     "complementan) y devolver el texto final corregido.\n"
     "Reglas:\n"
@@ -102,8 +102,8 @@ SELECT_FEW_SHOT = [
 ]
 
 
-def _format_pair(original: str, api: str) -> str:
-    return f"A: {original}\nB: {api}"
+def _format_pair(original: str, trocr: str) -> str:
+    return f"A: {original}\nB: {trocr}"
 
 
 def _chat(text: str, messages: list[dict] | None = None) -> str:
@@ -132,7 +132,7 @@ def _chat(text: str, messages: list[dict] | None = None) -> str:
     with urllib.request.urlopen(request, timeout=LLAMA_TIMEOUT) as response:
         data = json.load(response)
     content = data["choices"][0]["message"]["content"]
-    print(f"[LLM] entrada={text!r} -> respuesta={content!r}", flush=True)
+    # print(f"[LLM] entrada={text!r} -> respuesta={content!r}", flush=True)
     return content
 
 
@@ -155,16 +155,16 @@ def correct_text(text: str) -> str:
     return corrected
 
 
-def resolve_text(original: str, api: str) -> str:
-    """El LLM elige entre la lectura OCR original y la de la API, y la corrige.
+def resolve_text(original: str, trocr: str) -> str:
+    """El LLM elige entre la lectura OCR original y la de TrOCR, y la corrige.
 
-    Ante cualquier fallo o respuesta dudosa se usa la API (o el original si no hay).
+    Ante cualquier fallo o respuesta dudosa se usa TrOCR (o el original si no hay).
     """
-    candidates = [t for t in (api, original) if t and t.strip()]
+    candidates = [t for t in (trocr, original) if t and t.strip()]
     if not candidates:
-        return api or original
+        return trocr or original
     fallback = candidates[0]
-    pair = _format_pair(original, api)
+    pair = _format_pair(original, trocr)
     messages = [
         {"role": "system", "content": SELECT_PROMPT},
         *[
@@ -200,7 +200,7 @@ def refine_folder(tsv_path: Path, json_path: Path, workers: int = 2) -> int:
     data = json.loads(Path(json_path).read_text(encoding="utf-8"))
     detections = data["detecciones"]
     pairs = {
-        (d["texto"].get("ocr_original", ""), d["texto"].get("api", ""))
+        (d["texto"].get("ocr_original", ""), d["texto"].get("trocr", ""))
         for d in detections
     }
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -208,7 +208,7 @@ def refine_folder(tsv_path: Path, json_path: Path, workers: int = 2) -> int:
 
     by_geometry = {}
     for d in detections:
-        pair = (d["texto"].get("ocr_original", ""), d["texto"].get("api", ""))
+        pair = (d["texto"].get("ocr_original", ""), d["texto"].get("trocr", ""))
         d["texto"]["llm"] = resolved[pair]
         by_geometry[tuple(str(d[k]) for k in GEOMETRY_KEYS)] = resolved[pair]
     Path(json_path).write_text(
