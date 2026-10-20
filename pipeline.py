@@ -11,6 +11,7 @@ Requiere llama-server activo (ver llm_post_ocr.py).
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 
 import llm_post_ocr
@@ -39,16 +40,33 @@ def sync_json(output_dir: Path, key: str) -> None:
 
 
 def run(images: Path, skip_ocr: bool, skip_api: bool, workers: int = 2) -> None:
+    start = time.perf_counter()
+    stage_times: dict[str, float] = {}
+
     if not skip_ocr:
         print("== 1/3 Detección y recortes ==")
+        t = time.perf_counter()
         process_folder(images, max_workers=workers)
+        stage_times["OCR + recortes"] = time.perf_counter() - t
     if not skip_api:
         print("== 2/3 API OCR ==")
+        t = time.perf_counter()
         send_to_api.process_all(OUTPUT_DIR)
         sync_json(OUTPUT_DIR, "api")
-    print("== 3/3 Post-OCR con LLM sobre los TSV ==")
-    llm_post_ocr.clean_all(OUTPUT_DIR)
-    sync_json(OUTPUT_DIR, "llm")
+        stage_times["API"] = time.perf_counter() - t
+    print("== 3/3 Post-OCR con LLM (original vs API) ==")
+    t = time.perf_counter()
+    processed = llm_post_ocr.refine_all(OUTPUT_DIR, OUTPUT_OCR_DIR)
+    stage_times["LLM"] = time.perf_counter() - t
+
+    total = time.perf_counter() - start
+    print("\n========== INFORME FINAL ==========")
+    print(f"Imágenes procesadas:        {processed}")
+    print(f"Tiempo total del proceso:   {total:.2f} s")
+    if processed:
+        print(f"Tiempo promedio por imagen: {total / processed:.2f} s")
+    for name, seconds in stage_times.items():
+        print(f"  - {name}: {seconds:.2f} s")
 
 
 if __name__ == "__main__":

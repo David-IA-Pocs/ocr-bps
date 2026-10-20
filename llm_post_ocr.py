@@ -27,6 +27,7 @@ LLAMA_TIMEOUT = float(os.environ.get("LLAMA_TIMEOUT", "60"))
 
 # Si el texto corregido se parece menos que esto al original, se descarta.
 MIN_SIMILARITY = 0.5
+GEOMETRY_KEYS = ("left", "top", "width", "height")
 
 SYSTEM_PROMPT = (
     "Eres un corrector de texto obtenido por OCR en español (cheques y documentos "
@@ -42,14 +43,12 @@ SYSTEM_PROMPT = (
     "más parecida que tenga sentido en el contexto: 'Drez' -> 'Diez', "
     "'einco' -> 'cinco', 'tresc1entos' -> 'trescientos', 'seis' nunca debe pasar "
     "a 'siete'.\n"
-    "3. Restaura tildes ('dolares' -> 'dólares') y conserva las mayúsculas del "
-    "original: si empieza en minúscula, la respuesta también.\n"
-    "4. En tokens numéricos corrige caracteres confundidos: 'i10' -> '110', "
+    "3. En tokens numéricos corrige caracteres confundidos: 'i10' -> '110', "
     "'5O0' -> '500'.\n"
-    "5. NUNCA cambies el valor ni el sentido: no sustituyas un número por otro "
+    "4. NUNCA cambies el valor ni el sentido: no sustituyas un número por otro "
     "distinto, no agregues ni quites palabras o cifras, no traduzcas, no inventes "
     "nombres ni fechas. 'cinco' no es 'cincuenta'.\n"
-    "6. Si el texto ya es correcto o dudas, devuélvelo idéntico.\n"
+    "5. Si el texto ya es correcto o dudas, devuélvelo idéntico.\n"
     "Responde SOLO con el texto corregido en una línea, sin explicaciones, "
     "comillas ni formato."
 )
@@ -57,19 +56,61 @@ SYSTEM_PROMPT = (
 FEW_SHOT = [
     ("cincuentaycuatro", "cincuenta y cuatro"),
     ("Drez", "Diez"),
-    ("einco mil dolares exactos", "cinco mil dólares exactos"),
+    ("einco mil dolares exactos", "cinco mil dolares exactos"),
     ("ciento veintitresmil", "ciento veintitrés mil"),
     ("i10 pesos", "110 pesos"),
-    ("veintiunodolares", "veintiún dólares"),
+    ("veintiunodolares", "veintiun dolares"),
     ("einco mil", "cinco mil"),
     ("Banco Pichincha", "Banco Pichincha"),
+    ("dolav", "dolar"),
 ]
 
 
-def _chat(text: str) -> str:
+SELECT_PROMPT = (
+    "Recibes dos lecturas OCR del MISMO fragmento de un cheque o documento bancario "
+    "en español: 'A' (OCR local) y 'B' (OCR de la API). Cada una puede tener errores.\n"
+    "Tu tarea: decidir cuál tiene más sentido semántico (o combinarlas si se "
+    "complementan) y devolver el texto final corregido.\n"
+    "Reglas:\n"
+    "1. Separa palabras pegadas: 'cincuentaycuatro' -> 'cincuenta y cuatro'. Las "
+    "cifras en letras van separadas, con 'y' entre decenas y unidades (31-99); "
+    "del 16 al 29 van juntas (dieciséis, veintiuno).\n"
+    "2. Repara letras confundidas eligiendo la palabra más parecida con sentido: "
+    "'Drez' -> 'Diez', 'einco' -> 'cinco'. En números corrige 'i10' -> '110'.\n"
+    "3. Si las lecturas difieren, prefiere la que forme una palabra o cifra válida "
+    "y coherente; no inventes contenido que no esté en ninguna.\n"
+    "4. NUNCA cambies el valor ni el sentido: no sustituyas un número por otro "
+    "distinto ('cinco' no es 'cincuenta'), no agregues ni quites palabras o cifras.\n"
+    "Responde SOLO con el texto final en una línea, sin explicaciones, comillas "
+    "ni etiquetas."
+)
+
+SELECT_FEW_SHOT = [
+    (("cincuentaycuatro", "cincuenta y cuatro"), "cincuenta y cuatro"),
+    (("Drez", "Diez"), "Diez"),
+    (("einco mil", "cinco mil"), "cinco mil"),
+    (("cinco mil dolares", "cinco mi1 d0lares"), "cinco mil dolares"),
+    (("i10", "110"), "110"),
+    (("veintiunodolares", "veintiun d0lares"), "veintiun dolares"),
+    (("Banco Pichincha", ""), "Banco Pichincha"),
+    (("Banco Pichincha", "Banco Pichincha"), "Banco Pichincha"),
+    (("LASUMADE", "LA5UMADE"), "LA SUMA DE"),
+    (("dolav", "dolar"), "dolar"),
+    (("dolaves", "d0lares"), "dolares"),
+    (("Nn dolav", "un dolav"), "Un dolar"),
+    (("LASUMADE", "LA5UMADE"), "LA SUMA DE")
+]
+
+
+def _format_pair(original: str, api: str) -> str:
+    return f"A: {original}\nB: {api}"
+
+
+def _chat(text: str, messages: list[dict] | None = None) -> str:
     payload = {
         "model": LLAMA_MODEL,
-        "messages": [
+        "messages": messages
+        or [
             {"role": "system", "content": SYSTEM_PROMPT},
             *[
                 {"role": role, "content": content}
@@ -114,46 +155,99 @@ def correct_text(text: str) -> str:
     return corrected
 
 
-def clean_tsv(tsv_path: Path, column: str = "text", workers: int = 2) -> int:
-    """Corrige con el LLM la columna de texto del TSV, sobrescribiendo el mismo archivo.
+def resolve_text(original: str, api: str) -> str:
+    """El LLM elige entre la lectura OCR original y la de la API, y la corrige.
 
-    Devuelve cuántas filas cambiaron. Usar workers <= slots (-np) de llama-server.
+    Ante cualquier fallo o respuesta dudosa se usa la API (o el original si no hay).
     """
-    tsv_path = Path(tsv_path)
-    with tsv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.reader(handle, delimiter="\t"))
-    if not rows or column not in rows[0]:
-        raise ValueError(f"{tsv_path} no tiene la columna '{column}'")
-    index = rows[0].index(column)
-    body = [row for row in rows[1:] if len(row) > index]
+    candidates = [t for t in (api, original) if t and t.strip()]
+    if not candidates:
+        return api or original
+    fallback = candidates[0]
+    pair = _format_pair(original, api)
+    messages = [
+        {"role": "system", "content": SELECT_PROMPT},
+        *[
+            {"role": role, "content": content}
+            for (a, b), target in SELECT_FEW_SHOT
+            for role, content in (("user", _format_pair(a, b)), ("assistant", target))
+        ],
+        {"role": "user", "content": pair},
+    ]
+    try:
+        answer = _chat(pair, messages).strip()
+    except Exception as error:
+        print(f"[llm_post_ocr] fallo, se usa '{fallback}': {error}", file=sys.stderr)
+        return fallback
+    if "</think>" in answer:
+        answer = answer.split("</think>")[-1].strip()
+    answer = answer.strip('"\'`')
+    for label in ("A:", "B:"):
+        if answer.startswith(label):
+            answer = answer[len(label):].strip()
+    if not answer or "\n" in answer:
+        return fallback
+    best = max(
+        SequenceMatcher(None, c.lower(), answer.lower()).ratio() for c in candidates
+    )
+    return answer if best >= MIN_SIMILARITY else fallback
 
-    unique_texts = {row[index] for row in body if row[index].strip()}
+
+def refine_folder(tsv_path: Path, json_path: Path, workers: int = 2) -> int:
+    """Resuelve cada detección con el LLM y guarda el resultado en el JSON (texto.llm)
+    y en la columna text del TSV (mismo archivo). Devuelve cuántas filas del TSV cambiaron.
+    """
+    data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    detections = data["detecciones"]
+    pairs = {
+        (d["texto"].get("ocr_original", ""), d["texto"].get("api", ""))
+        for d in detections
+    }
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        corrections = dict(zip(unique_texts, executor.map(correct_text, unique_texts)))
+        resolved = dict(zip(pairs, executor.map(lambda p: resolve_text(*p), pairs)))
 
+    by_geometry = {}
+    for d in detections:
+        pair = (d["texto"].get("ocr_original", ""), d["texto"].get("api", ""))
+        d["texto"]["llm"] = resolved[pair]
+        by_geometry[tuple(str(d[k]) for k in GEOMETRY_KEYS)] = resolved[pair]
+    Path(json_path).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    with Path(tsv_path).open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle, delimiter="\t"))
+    header = rows[0]
+    text_index = header.index("text")
+    geometry_index = [header.index(k) for k in GEOMETRY_KEYS]
     changed = 0
-    for row in body:
-        new = corrections.get(row[index], row[index])
-        changed += new != row[index]
-        row[index] = new
-
-    temp_path = tsv_path.with_suffix(".tsv.tmp")
+    for row in rows[1:]:
+        new = by_geometry.get(tuple(row[i] for i in geometry_index))
+        if new is not None:
+            changed += new != row[text_index]
+            row[text_index] = new
+    temp_path = Path(tsv_path).with_suffix(".tsv.tmp")
     with temp_path.open("w", encoding="utf-8", newline="") as handle:
         csv.writer(handle, delimiter="\t", lineterminator="\n").writerows(rows)
     temp_path.replace(tsv_path)
     return changed
 
 
-def clean_all(output_dir: Path) -> None:
+def refine_all(output_dir: Path, json_dir: Path) -> int:
+    """Aplica refine_folder a cada TSV de output_dir. Devuelve cuántos se procesaron."""
+    done = 0
     tsv_files = sorted(Path(output_dir).rglob("*.tsv"))
     for tsv_file in tsv_files:
+        json_file = Path(json_dir) / f"{tsv_file.parent.name.removesuffix('_ocr')}.json"
         try:
-            changed = clean_tsv(tsv_file)
-            print(f"[LLM] {tsv_file.parent.name}/{tsv_file.name}: {changed} filas corregidas")
-        except (OSError, ValueError) as error:
+            changed = refine_folder(tsv_file, json_file)
+            done += 1
+            print(f"[LLM] {tsv_file.parent.name}: {changed} filas cambiadas")
+        except (OSError, ValueError, KeyError) as error:
             print(f"[LLM][ERROR] {tsv_file}: {error}")
     if not tsv_files:
         print(f"[LLM] Sin TSV en: {output_dir}")
+    return done
 
 
 if __name__ == "__main__":
