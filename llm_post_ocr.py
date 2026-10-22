@@ -2,6 +2,7 @@
 
 Requiere un llama-server en marcha, por ejemplo:
     llama-server -m Qwen.gguf --port 8080 -c 4096 -ngl 99
+    llama-server.exe -m Qwen2.5-3B/qwen2.5-3b-instruct-q4_k_m.gguf -ngl 99 --port 9931 -c 4096 -np 2
 
 Variables de entorno opcionales:
     LLAMA_URL    (default http://127.0.0.1:9931)

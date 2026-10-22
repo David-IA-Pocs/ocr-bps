@@ -3,12 +3,11 @@ from pathlib import Path
 
 from pipeline import run
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Ejecuta el flujo completo: OCR + recortes -> TrOCR -> post-OCR con LLM."
     )
-    parser.add_argument("--workers", type=int, default=6, help="Cantidad de workers a usar.")
+    parser.add_argument("--workers", type=int, default=4, help="Cantidad de workers a usar.")
     parser.add_argument("--skip-ocr", action="store_true", help="Reutiliza output/ ya generado.")
     parser.add_argument("--skip-trocr", action="store_true", help="No ejecuta TrOCR.")
     parser.add_argument(

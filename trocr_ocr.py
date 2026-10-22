@@ -15,12 +15,13 @@ from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from tsv_utils import guardar_tsv, leer_tsv
 
 MODEL_NAME = "microsoft/trocr-base-printed"
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 REQUIRED_COLUMNS = {"text", "conf", "left", "top", "width", "height"}
 
 _state: dict = {}
 _load_lock = threading.Lock()
+_gpu_lock = threading.Lock()
 
 
 def _select_device():
@@ -42,7 +43,11 @@ def load_model():
             device, name = _select_device()
             print(f"[TrOCR] Cargando {MODEL_NAME} en {name}")
             processor = TrOCRProcessor.from_pretrained(MODEL_NAME, use_fast=True)
-            model = VisionEncoderDecoderModel.from_pretrained(MODEL_NAME).to(device).eval()
+            model = VisionEncoderDecoderModel.from_pretrained(MODEL_NAME).eval()
+            # fp16 en CUDA: la T4 tiene tensor cores y la inferencia rinde ~2x.
+            if device.type == "cuda":
+                model = model.half()
+            model = model.to(device)
             _state.update(device=device, processor=processor, model=model)
     return _state["device"], _state["processor"], _state["model"]
 
@@ -62,11 +67,12 @@ def _bbox_key(left: str, top: str, width: str, height: str) -> tuple[str, str, s
     return norm(left), norm(top), norm(width), norm(height)
 
 
-def recognize(images: list[Image.Image]) -> list[tuple[str, float | None]]:
-    """Devuelve (texto, confianza) por imagen, con la misma métrica que la API."""
+def recognize(pixel_values: torch.Tensor) -> list[tuple[str, float | None]]:
+    """Devuelve (texto, confianza) por recorte ya preprocesado (CPU), con la misma métrica que la API."""
     device, processor, model = load_model()
-    pixel_values = processor(images, return_tensors="pt").pixel_values.to(device)
-    with torch.no_grad():
+    pixel_values = pixel_values.to(device, dtype=model.dtype, non_blocking=True)
+    # La GPU es una sola: la inferencia se serializa, el resto (E/S, preproceso) corre en paralelo.
+    with _gpu_lock, torch.inference_mode():
         output = model.generate(
             pixel_values, return_dict_in_generate=True, output_scores=True
         )
@@ -105,7 +111,9 @@ def process_folder(folder: Path) -> int:
             _bbox_key(row["left"], row["top"], row["width"], row["height"]), []
         ).append(row)
 
-    crops = []
+    _, processor, _ = load_model()
+    keys = []
+    images = []
     for path in sorted(folder.iterdir()):
         if path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
@@ -113,14 +121,18 @@ def process_folder(folder: Path) -> int:
         if bbox is None or _bbox_key(*bbox) not in index:
             continue
         try:
-            crops.append((_bbox_key(*bbox), Image.open(path).convert("RGB")))
+            with Image.open(path) as img:
+                images.append(img.convert("RGB"))
+            keys.append(_bbox_key(*bbox))
         except (UnidentifiedImageError, OSError) as error:
             print(f"[TrOCR][ERROR] {path.name}: {error}")
 
     updated = 0
-    for start in range(0, len(crops), BATCH_SIZE):
-        batch = crops[start : start + BATCH_SIZE]
-        for (key, _), (text, confidence) in zip(batch, recognize([c[1] for c in batch])):
+    for start in range(0, len(images), BATCH_SIZE):
+        # Preproceso en CPU fuera del candado de GPU: se solapa con la inferencia de otras carpetas.
+        pixel_values = processor(images[start : start + BATCH_SIZE], return_tensors="pt").pixel_values
+        batch_keys = keys[start : start + BATCH_SIZE]
+        for key, (text, confidence) in zip(batch_keys, recognize(pixel_values)):
             for row in index[key]:
                 row["text"] = text
                 row["conf"] = f"{confidence:.6f}" if confidence is not None else ""

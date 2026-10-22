@@ -176,9 +176,17 @@ def list_images(folder: Path) -> list[Path]:
     )
 
 
-def iter_process_images(folder_path: str | Path, max_workers: int = 2):
+def _warm_worker() -> int:
+    """Construye el motor OCR del worker (carga de modelos) sin procesar ninguna imagen."""
+    _get_worker_ocr_engine()
+    time.sleep(0.5)  # evita que un mismo worker absorba todas las tareas de calentamiento
+    return os.getpid()
+
+
+def iter_process_images(folder_path: str | Path, max_workers: int = 2, on_ready=None):
     """Procesa las imágenes en paralelo y cede (imagen, segundos) en cuanto cada una termina.
 
+    Antes de procesar la primera imagen carga los modelos de todos los workers y llama a on_ready().
     Al ceder una imagen ya existen su carpeta de recortes, su TSV y su JSON.
     """
     folder = Path(folder_path).expanduser().resolve()
@@ -194,6 +202,10 @@ def iter_process_images(folder_path: str | Path, max_workers: int = 2):
 
     executor_class = ProcessPoolExecutor if max_workers > 1 else ThreadPoolExecutor
     with executor_class(max_workers=max_workers) as executor:
+        for warm in [executor.submit(_warm_worker) for _ in range(max_workers)]:
+            warm.result()
+        if on_ready:
+            on_ready()
         futures = {
             executor.submit(process_image_task, (path, index % max_workers + 1)): path
             for index, path in enumerate(image_paths)

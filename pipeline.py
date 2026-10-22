@@ -26,6 +26,8 @@ from ocr import OUTPUT_DIR, OUTPUT_OCR_DIR, iter_process_images
 DEFAULT_IMAGES = Path(__file__).resolve().parent / "muestras_venus"
 GEOMETRY_KEYS = ("left", "top", "width", "height")
 QUEUE_SIZE = 32  # límite por cola: evita acumular miles de imágenes en memoria
+TROCR_THREADS = 3  # preproceso/E-S en paralelo; la inferencia en GPU se serializa en trocr_ocr
+LLM_THREADS = 1  # refine_folder ya usa 2 hebras internas (= -np 2 de llama-server)
 END = None
 
 
@@ -68,7 +70,8 @@ class Stats:
             self.image_seconds[stem] = self.image_seconds.get(stem, 0.0) + seconds
 
 
-def _stage_worker(name, handler, inbox, outbox, stats: Stats, last: bool) -> None:
+def _stage_worker(name, handler, inbox, outbox, stats: Stats, last: bool, pending: list) -> None:
+    # `pending` es un contador compartido (lista de 1 elemento) con la cantidad de hebras activas de la etapa.
     while True:
         stem = inbox.get()
         if stem is END:
@@ -88,8 +91,13 @@ def _stage_worker(name, handler, inbox, outbox, stats: Stats, last: bool) -> Non
                 stats.completed.add(stem)
         else:
             outbox.put(stem)
-    if outbox is not None:
-        outbox.put(END)
+    with stats.lock:
+        pending[0] -= 1
+        remaining = pending[0]
+    if remaining:
+        inbox.put(END)  # despierta a las hebras hermanas
+    elif outbox is not None:
+        outbox.put(END)  # la última hebra cierra la etapa siguiente
 
 
 def run(images: Path, skip_ocr: bool, skip_trocr: bool, workers: int = 2) -> None:
@@ -104,41 +112,66 @@ def run(images: Path, skip_ocr: bool, skip_trocr: bool, workers: int = 2) -> Non
             trocr_ocr.process_folder(_folder(stem))
             sync_json(_tsv(stem), _json(stem), "trocr")
 
-        stages.append(("TrOCR", trocr_handler))
+        stages.append(("TrOCR", trocr_handler, TROCR_THREADS))
 
     def llm_handler(stem: str) -> None:
         llm_post_ocr.refine_folder(_tsv(stem), _json(stem))
 
-    stages.append(("LLM", llm_handler))
+    stages.append(("LLM", llm_handler, LLM_THREADS))
 
     queues = [queue.Queue(maxsize=QUEUE_SIZE) for _ in stages]
     threads = []
-    for index, (name, handler) in enumerate(stages):
+    for index, (name, handler, count) in enumerate(stages):
         last = index == len(stages) - 1
         outbox = None if last else queues[index + 1]
-        threads.append(
-            threading.Thread(
-                target=_stage_worker,
-                args=(name, handler, queues[index], outbox, stats, last),
-                name=name,
+        pending = [count]
+        for n in range(count):
+            threads.append(
+                threading.Thread(
+                    target=_stage_worker,
+                    args=(name, handler, queues[index], outbox, stats, last, pending),
+                    name=f"{name}-{n}",
+                )
             )
-        )
 
-    start = time.perf_counter()
+    # Calentamiento: carga de modelos (TrOCR, LLM, motores OCR) fuera del tiempo medido.
+    def warm_trocr() -> None:
+        from PIL import Image
+
+        _, processor, _ = trocr_ocr.load_model()
+        blank = Image.new("RGB", (256, 64), "white")
+        trocr_ocr.recognize(processor([blank], return_tensors="pt").pixel_values)
+
+    def warm_llm() -> None:
+        try:
+            llm_post_ocr._chat("prueba")
+        except Exception as error:
+            print(f"[LLM][AVISO] calentamiento falló: {error}", flush=True)
+
+    warmups = [threading.Thread(target=warm_llm, daemon=True)]
     if not skip_trocr:
-        # Carga el modelo mientras la detección arranca, no cuando llega la primera imagen.
-        threading.Thread(target=trocr_ocr.load_model, daemon=True).start()
-    for thread in threads:
+        warmups.append(threading.Thread(target=warm_trocr, daemon=True))
+    print("Cargando modelos (no cuenta en el tiempo medido)...", flush=True)
+    for thread in warmups + threads:
         thread.start()
+
+    timer = {}
+
+    def on_ready() -> None:
+        for warm in warmups:
+            warm.join()
+        timer["start"] = time.perf_counter()
+        print("Modelos listos. Iniciando medición.", flush=True)
 
     # Etapa 1 (esta hebra): cada imagen entra a la cola en cuanto termina de recortarse.
     try:
         if skip_ocr:
+            on_ready()
             stems = sorted(p.name.removesuffix("_ocr") for p in OUTPUT_DIR.glob("*_ocr") if p.is_dir())
             for stem in stems:
                 queues[0].put(stem)
         else:
-            for image_path, seconds in iter_process_images(images, workers):
+            for image_path, seconds in iter_process_images(images, workers, on_ready):
                 stats.add("OCR+recortes", image_path.stem, seconds)
                 queues[0].put(image_path.stem)
     finally:
@@ -146,7 +179,7 @@ def run(images: Path, skip_ocr: bool, skip_trocr: bool, workers: int = 2) -> Non
         for thread in threads:
             thread.join()
 
-    total = time.perf_counter() - start
+    total = time.perf_counter() - timer["start"] if "start" in timer else 0.0
     processed = len(stats.completed)
     print("\n========== INFORME FINAL ==========")
     print(f"Imágenes procesadas:        {processed}")
